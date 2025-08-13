@@ -2,21 +2,14 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from functools import wraps
-import os
-import logging
 from datetime import datetime
-import uuid
-import hashlib
-import base64
 from io import BytesIO
 from PIL import Image, ImageOps
-import requests
 from openai import OpenAI
 from dotenv import load_dotenv
-import threading
-import time
-import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any
+from PIL import ImageEnhance, ImageFilter
+import os, logging, uuid, base64, threading, time, cv2, colorsys, numpy as np
 
 # Load environment variables
 load_dotenv()
@@ -306,6 +299,247 @@ class RateLimiter:
                 if not self.requests[ip]:
                     del self.requests[ip]
 
+class Base64ImageProcessor:
+    """Enhanced image processor for base64 operations"""
+    
+    @staticmethod
+    def decode_base64_image(base64_string: str) -> tuple[Image.Image, str]:
+        """
+        Decode base64 string to PIL Image object
+        
+        Args:
+            base64_string: Base64 encoded image string (with or without data URL prefix)
+            
+        Returns:
+            tuple: (PIL Image object, original format)
+            
+        Raises:
+            ValueError: If base64 string is invalid or not an image
+        """
+        try:
+            # Handle data URL format (data:image/png;base64,...)
+            if base64_string.startswith('data:image'):
+                # Extract the base64 part after the comma
+                header, encoded = base64_string.split(',', 1)
+                # Extract format from header (e.g., 'png' from 'data:image/png;base64')
+                format_type = header.split('/')[1].split(';')[0].upper()
+            else:
+                # Pure base64 string without data URL prefix
+                encoded = base64_string
+                format_type = 'UNKNOWN'
+            
+            # Decode base64 to bytes
+            image_bytes = base64.b64decode(encoded)
+            
+            # Create PIL Image from bytes
+            image = Image.open(BytesIO(image_bytes))
+            
+            # Determine format if unknown
+            if format_type == 'UNKNOWN':
+                format_type = image.format or 'PNG'
+            
+            return image, format_type
+            
+        except Exception as e:
+            raise ValueError(f"Failed to decode base64 image: {str(e)}")
+    
+    @staticmethod
+    def encode_image_to_base64(image: Image.Image, format_type: str = 'PNG', quality: int = 95) -> str:
+        """
+        Encode PIL Image to base64 string with data URL prefix
+        
+        Args:
+            image: PIL Image object
+            format_type: Output format ('PNG', 'JPEG', 'WEBP')
+            quality: JPEG quality (1-100), ignored for PNG
+            
+        Returns:
+            str: Base64 encoded image with data URL prefix
+        """
+        try:
+            # Create buffer to hold image bytes
+            buffer = BytesIO()
+            
+            # Handle different formats
+            if format_type.upper() == 'JPEG':
+                # Convert to RGB if necessary for JPEG
+                if image.mode in ('RGBA', 'LA'):
+                    # Create white background for transparency
+                    background = Image.new('RGB', image.size, (255, 255, 255))
+                    background.paste(image, mask=image.split()[-1] if image.mode == 'RGBA' else None)
+                    image = background
+                elif image.mode != 'RGB':
+                    image = image.convert('RGB')
+                
+                image.save(buffer, format='JPEG', quality=quality, optimize=True)
+                mime_type = 'image/jpeg'
+                
+            elif format_type.upper() == 'PNG':
+                image.save(buffer, format='PNG', optimize=True)
+                mime_type = 'image/png'
+                
+            elif format_type.upper() == 'WEBP':
+                image.save(buffer, format='WEBP', quality=quality, optimize=True)
+                mime_type = 'image/webp'
+                
+            else:
+                # Default to PNG for unsupported formats
+                image.save(buffer, format='PNG', optimize=True)
+                mime_type = 'image/png'
+            
+            # Encode to base64
+            img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            
+            # Return with data URL prefix
+            return f"data:{mime_type};base64,{img_str}"
+            
+        except Exception as e:
+            raise ValueError(f"Failed to encode image to base64: {str(e)}")
+    
+    @staticmethod
+    def convert_to_grayscale(image: Image.Image) -> Image.Image:
+        """Convert image to grayscale"""
+        return image.convert('L').convert('RGB')  # Convert back to RGB for consistency
+    
+    @staticmethod
+    def detect_edges(image: Image.Image, threshold1: int = 100, threshold2: int = 200) -> Image.Image:
+        """
+        Detect edges using Canny edge detection
+        
+        Args:
+            image: PIL Image object
+            threshold1: First threshold for edge detection
+            threshold2: Second threshold for edge detection
+            
+        Returns:
+            PIL Image with detected edges
+        """
+        try:
+            # Convert PIL to OpenCV format
+            cv_image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            
+            # Convert to grayscale for edge detection
+            gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+            
+            # Apply Canny edge detection
+            edges = cv2.Canny(gray, threshold1, threshold2)
+            
+            # Convert back to RGB format
+            edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+            
+            # Convert back to PIL Image
+            return Image.fromarray(edges_rgb)
+            
+        except Exception as e:
+            # Fallback to PIL edge detection if OpenCV fails
+            return image.convert('L').filter(ImageFilter.FIND_EDGES).convert('RGB')
+    
+    @staticmethod
+    def analyze_dominant_colors(image: Image.Image, num_colors: int = 5) -> tuple[Image.Image, List[Dict]]:
+        """
+        Analyze dominant colors in the image
+        
+        Args:
+            image: PIL Image object
+            num_colors: Number of dominant colors to extract
+            
+        Returns:
+            tuple: (Original image, List of dominant color info)
+        """
+        try:
+            # Resize image for faster processing
+            temp_image = image.copy()
+            temp_image.thumbnail((150, 150), Image.Resampling.LANCZOS)
+            
+            # Convert to RGB if necessary
+            if temp_image.mode != 'RGB':
+                temp_image = temp_image.convert('RGB')
+            
+            # Get pixel data
+            pixels = list(temp_image.getdata())
+            
+            # Use k-means clustering to find dominant colors
+            from collections import Counter
+            
+            # Simple color quantization (alternative to k-means for simplicity)
+            # Group similar colors
+            color_counts = Counter(pixels)
+            dominant_colors = color_counts.most_common(num_colors)
+            
+            # Create color info
+            color_info = []
+            total_pixels = len(pixels)
+            
+            for i, (color, count) in enumerate(dominant_colors):
+                percentage = (count / total_pixels) * 100
+                
+                # Convert RGB to HSV for additional info
+                h, s, v = colorsys.rgb_to_hsv(color[0]/255, color[1]/255, color[2]/255)
+                
+                color_info.append({
+                    "rank": i + 1,
+                    "rgb": color,
+                    "hex": f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}",
+                    "percentage": round(percentage, 2),
+                    "hue": round(h * 360, 1),
+                    "saturation": round(s * 100, 1),
+                    "brightness": round(v * 100, 1)
+                })
+            
+            return image, color_info
+            
+        except Exception as e:
+            # Return original image with error info
+            return image, [{"error": f"Color analysis failed: {str(e)}"}]
+    
+    @staticmethod
+    def enhance_image(image: Image.Image, enhancement_type: str = 'auto') -> Image.Image:
+        """
+        Enhance image quality
+        
+        Args:
+            image: PIL Image object
+            enhancement_type: Type of enhancement ('brightness', 'contrast', 'sharpness', 'color', 'auto')
+            
+        Returns:
+            Enhanced PIL Image
+        """
+        try:
+            enhanced_image = image.copy()
+            
+            if enhancement_type == 'brightness':
+                enhancer = ImageEnhance.Brightness(enhanced_image)
+                enhanced_image = enhancer.enhance(1.2)
+                
+            elif enhancement_type == 'contrast':
+                enhancer = ImageEnhance.Contrast(enhanced_image)
+                enhanced_image = enhancer.enhance(1.3)
+                
+            elif enhancement_type == 'sharpness':
+                enhancer = ImageEnhance.Sharpness(enhanced_image)
+                enhanced_image = enhancer.enhance(1.5)
+                
+            elif enhancement_type == 'color':
+                enhancer = ImageEnhance.Color(enhanced_image)
+                enhanced_image = enhancer.enhance(1.2)
+                
+            elif enhancement_type == 'auto':
+                # Apply multiple enhancements
+                enhancer = ImageEnhance.Contrast(enhanced_image)
+                enhanced_image = enhancer.enhance(1.1)
+                
+                enhancer = ImageEnhance.Sharpness(enhanced_image)
+                enhanced_image = enhancer.enhance(1.2)
+                
+                enhancer = ImageEnhance.Color(enhanced_image)
+                enhanced_image = enhancer.enhance(1.1)
+            
+            return enhanced_image
+            
+        except Exception as e:
+            # Return original image if enhancement fails
+            return image
+
 # Initialize Flask app
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -314,6 +548,7 @@ CORS(app, origins=["*"])
 # Initialize components
 analyzer = ImageAnalysisAPI()
 processor = ImageProcessor()
+base64_processor = Base64ImageProcessor()
 rate_limiter = RateLimiter()
 
 # Setup logging
@@ -482,6 +717,267 @@ def analyze_batch():
             "error_code": "BATCH_ANALYSIS_FAILED"
         }), 500
 
+
+# API Routes for Base64 Image Processing
+
+@app.route('/api/v1/process/grayscale', methods=['POST'])
+@require_rate_limit
+@log_request
+def process_grayscale():
+    """Convert image to grayscale via base64"""
+    return _process_base64_image(
+        process_func=base64_processor.convert_to_grayscale,
+        process_name="grayscale"
+    )
+
+@app.route('/api/v1/process/edges', methods=['POST'])
+@require_rate_limit
+@log_request
+def process_edges():
+    """Detect edges in image via base64"""
+    def edge_detection(image):
+        threshold1 = int(request.form.get('threshold1', 100))
+        threshold2 = int(request.form.get('threshold2', 200))
+        return base64_processor.detect_edges(image, threshold1, threshold2)
+    
+    return _process_base64_image(
+        process_func=edge_detection,
+        process_name="edge_detection"
+    )
+
+@app.route('/api/v1/process/colors', methods=['POST'])
+@require_rate_limit
+@log_request
+def process_colors():
+    """Analyze dominant colors in image via base64"""
+    try:
+        # Get base64 input
+        base64_input = request.json.get('image_base64') if request.is_json else request.form.get('image_base64')
+        
+        if not base64_input:
+            return jsonify({
+                "success": False,
+                "error": "No base64 image data provided. Include 'image_base64' parameter.",
+                "error_code": "NO_BASE64_INPUT"
+            }), 400
+        
+        # Decode base64 image
+        try:
+            image, original_format = base64_processor.decode_base64_image(base64_input)
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e),
+                "error_code": "INVALID_BASE64"
+            }), 400
+        
+        # Get number of colors to analyze
+        num_colors = int(request.form.get('num_colors', 5)) if not request.is_json else int(request.json.get('num_colors', 5))
+        
+        # Analyze dominant colors
+        processed_image, color_info = base64_processor.analyze_dominant_colors(image, num_colors)
+        
+        # Encode result back to base64
+        output_format = request.form.get('output_format', original_format) if not request.is_json else request.json.get('output_format', original_format)
+        result_base64 = base64_processor.encode_image_to_base64(processed_image, output_format)
+        
+        return jsonify({
+            "success": True,
+            "process_type": "color_analysis",
+            "input_format": original_format,
+            "output_format": output_format,
+            "image_base64": result_base64,
+            "dominant_colors": color_info,
+            "metadata": {
+                "num_colors_analyzed": num_colors,
+                "image_size": image.size,
+                "processed_in_memory": True
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Color analysis failed: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Color analysis failed: {str(e)}",
+            "error_code": "COLOR_ANALYSIS_FAILED"
+        }), 500
+
+@app.route('/api/v1/process/enhance', methods=['POST'])
+@require_rate_limit
+@log_request
+def process_enhance():
+    """Enhance image quality via base64"""
+    def enhancement(image):
+        enhancement_type = request.form.get('enhancement_type', 'auto') if not request.is_json else request.json.get('enhancement_type', 'auto')
+        return base64_processor.enhance_image(image, enhancement_type)
+    
+    return _process_base64_image(
+        process_func=enhancement,
+        process_name="enhancement"
+    )
+
+@app.route('/api/v1/process/custom', methods=['POST'])
+@require_rate_limit
+@log_request
+def process_custom():
+    """Custom image processing via base64 with multiple operations"""
+    try:
+        # Get base64 input
+        base64_input = request.json.get('image_base64') if request.is_json else request.form.get('image_base64')
+        
+        if not base64_input:
+            return jsonify({
+                "success": False,
+                "error": "No base64 image data provided. Include 'image_base64' parameter.",
+                "error_code": "NO_BASE64_INPUT"
+            }), 400
+        
+        # Get processing operations
+        operations = request.json.get('operations', ['grayscale']) if request.is_json else request.form.getlist('operations') or ['grayscale']
+        
+        # Decode base64 image
+        try:
+            image, original_format = base64_processor.decode_base64_image(base64_input)
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e),
+                "error_code": "INVALID_BASE64"
+            }), 400
+        
+        # Apply operations in sequence
+        processed_image = image.copy()
+        applied_operations = []
+        
+        for operation in operations:
+            try:
+                if operation == 'grayscale':
+                    processed_image = base64_processor.convert_to_grayscale(processed_image)
+                    applied_operations.append("grayscale")
+                    
+                elif operation == 'edges':
+                    threshold1 = int(request.form.get('threshold1', 100)) if not request.is_json else int(request.json.get('threshold1', 100))
+                    threshold2 = int(request.form.get('threshold2', 200)) if not request.is_json else int(request.json.get('threshold2', 200))
+                    processed_image = base64_processor.detect_edges(processed_image, threshold1, threshold2)
+                    applied_operations.append("edge_detection")
+                    
+                elif operation == 'enhance':
+                    enhancement_type = request.form.get('enhancement_type', 'auto') if not request.is_json else request.json.get('enhancement_type', 'auto')
+                    processed_image = base64_processor.enhance_image(processed_image, enhancement_type)
+                    applied_operations.append("enhancement")
+                    
+            except Exception as e:
+                app.logger.warning(f"Operation {operation} failed: {str(e)}")
+        
+        # Encode result back to base64
+        output_format = request.form.get('output_format', original_format) if not request.is_json else request.json.get('output_format', original_format)
+        result_base64 = base64_processor.encode_image_to_base64(processed_image, output_format)
+        
+        return jsonify({
+            "success": True,
+            "process_type": "custom_processing",
+            "input_format": original_format,
+            "output_format": output_format,
+            "image_base64": result_base64,
+            "applied_operations": applied_operations,
+            "metadata": {
+                "requested_operations": operations,
+                "image_size": image.size,
+                "processed_in_memory": True
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Custom processing failed: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Custom processing failed: {str(e)}",
+            "error_code": "CUSTOM_PROCESSING_FAILED"
+        }), 500
+
+def _process_base64_image(process_func, process_name: str):
+    """
+    Helper function to process base64 images
+    
+    Args:
+        process_func: Function to apply to the image
+        process_name: Name of the processing operation
+        
+    Returns:
+        JSON response with processed image
+    """
+    try:
+        # Get base64 input from either JSON or form data
+        base64_input = request.json.get('image_base64') if request.is_json else request.form.get('image_base64')
+        
+        if not base64_input:
+            return jsonify({
+                "success": False,
+                "error": "No base64 image data provided. Include 'image_base64' parameter.",
+                "error_code": "NO_BASE64_INPUT"
+            }), 400
+        
+        # Step 1: Decode base64 string into image object
+        try:
+            image, original_format = base64_processor.decode_base64_image(base64_input)
+            app.logger.info(f"Successfully decoded base64 image: {original_format}, Size: {image.size}")
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": str(e),
+                "error_code": "INVALID_BASE64"
+            }), 400
+        
+        # Step 2: Apply image processing transformation
+        try:
+            processed_image = process_func(image)
+            app.logger.info(f"Successfully applied {process_name} processing")
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "error": f"Image processing failed: {str(e)}",
+                "error_code": "PROCESSING_FAILED"
+            }), 500
+        
+        # Step 3: Encode processed image back to base64
+        try:
+            output_format = request.form.get('output_format', original_format) if not request.is_json else request.json.get('output_format', original_format)
+            quality = int(request.form.get('quality', 95)) if not request.is_json else int(request.json.get('quality', 95))
+            
+            result_base64 = base64_processor.encode_image_to_base64(processed_image, output_format, quality)
+            app.logger.info(f"Successfully encoded result to base64: {output_format}")
+        except ValueError as e:
+            return jsonify({
+                "success": False,
+                "error": f"Base64 encoding failed: {str(e)}",
+                "error_code": "ENCODING_FAILED"
+            }), 500
+        
+        # Step 4: Return the processed base64 string
+        return jsonify({
+            "success": True,
+            "process_type": process_name,
+            "input_format": original_format,
+            "output_format": output_format,
+            "image_base64": result_base64,
+            "metadata": {
+                "image_size": processed_image.size,
+                "processed_in_memory": True,
+                "quality": quality if output_format.upper() == 'JPEG' else None
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        })
+        
+    except Exception as e:
+        app.logger.error(f"Base64 image processing failed: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Processing failed: {str(e)}",
+            "error_code": "PROCESSING_ERROR"
+        }), 500
 def _process_analysis_request(analysis_function):
     """Helper function to process analysis requests"""
     try:
